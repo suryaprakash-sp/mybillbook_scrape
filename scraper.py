@@ -5,8 +5,14 @@ Main scraper for MyBillBook inventory data
 import json
 import csv
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 from auth import MyBillBookAPI
 from models import InventoryItem, BulkUploadStatus
@@ -16,16 +22,27 @@ from config import OUTPUT_DIR, OUTPUT_FILES
 class InventoryScraper:
     """Main class for scraping MyBillBook inventory"""
 
-    def __init__(self):
+    def __init__(self, output_dir: str = OUTPUT_DIR, quiet: bool = False):
+        """
+        Initialize the scraper
+
+        Args:
+            output_dir: Directory to save output files
+            quiet: If True, suppress non-essential output
+        """
         self.api = MyBillBookAPI()
         self.items: List[InventoryItem] = []
+        self.all_items: List[InventoryItem] = []  # Store unfiltered items
+        self.output_dir = output_dir
+        self.quiet = quiet
         self._ensure_output_dir()
 
     def _ensure_output_dir(self):
         """Create output directory if it doesn't exist"""
-        if not os.path.exists(OUTPUT_DIR):
-            os.makedirs(OUTPUT_DIR)
-            print(f"Created output directory: {OUTPUT_DIR}")
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            if not self.quiet:
+                print(f"Created output directory: {self.output_dir}")
 
     def fetch_inventory(self) -> bool:
         """
@@ -106,8 +123,76 @@ class InventoryScraper:
             print(f"Error parsing response: {e}")
             return False
 
+        # Store unfiltered items
+        self.all_items = self.items.copy()
+
         print(f"\n[OK] Successfully fetched {len(self.items)} items!")
         return True
+
+    def apply_filters(
+        self,
+        category: Optional[str] = None,
+        min_stock: Optional[float] = None,
+        max_stock: Optional[float] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None
+    ):
+        """
+        Apply filters to the inventory items
+
+        Args:
+            category: Filter by category name
+            min_stock: Minimum stock quantity
+            max_stock: Maximum stock quantity
+            min_price: Minimum selling price
+            max_price: Maximum selling price
+        """
+        filtered_items = self.all_items.copy()
+
+        if category:
+            filtered_items = [
+                item for item in filtered_items
+                if category.lower() in (item.category_name or item.category or '').lower()
+            ]
+            if not self.quiet:
+                print(f"Filtered by category '{category}': {len(filtered_items)} items")
+
+        if min_stock is not None:
+            filtered_items = [
+                item for item in filtered_items
+                if float(item.quantity) >= min_stock
+            ]
+            if not self.quiet:
+                print(f"Filtered by min stock {min_stock}: {len(filtered_items)} items")
+
+        if max_stock is not None:
+            filtered_items = [
+                item for item in filtered_items
+                if float(item.quantity) <= max_stock
+            ]
+            if not self.quiet:
+                print(f"Filtered by max stock {max_stock}: {len(filtered_items)} items")
+
+        if min_price is not None:
+            filtered_items = [
+                item for item in filtered_items
+                if item.selling_price >= min_price
+            ]
+            if not self.quiet:
+                print(f"Filtered by min price {min_price}: {len(filtered_items)} items")
+
+        if max_price is not None:
+            filtered_items = [
+                item for item in filtered_items
+                if item.selling_price <= max_price
+            ]
+            if not self.quiet:
+                print(f"Filtered by max price {max_price}: {len(filtered_items)} items")
+
+        self.items = filtered_items
+
+        if not self.quiet:
+            print(f"\nTotal items after filters: {len(self.items)}")
 
     def save_json(self, detailed: bool = False):
         """
@@ -117,7 +202,7 @@ class InventoryScraper:
             detailed: If True, save with full details, else save compact version
         """
         filename = OUTPUT_FILES['detailed_json'] if detailed else OUTPUT_FILES['json']
-        filepath = os.path.join(OUTPUT_DIR, filename)
+        filepath = os.path.join(self.output_dir, filename)
 
         data = [item.to_dict() for item in self.items]
 
@@ -128,7 +213,7 @@ class InventoryScraper:
 
     def save_csv(self):
         """Save inventory data as CSV"""
-        filepath = os.path.join(OUTPUT_DIR, OUTPUT_FILES['csv'])
+        filepath = os.path.join(self.output_dir, OUTPUT_FILES['csv'])
 
         if not self.items:
             print("No items to save.")
@@ -158,6 +243,46 @@ class InventoryScraper:
                 writer.writerow(row)
 
         print(f"[OK] Saved CSV: {filepath} ({len(self.items)} items)")
+
+    def save_excel(self):
+        """Save inventory data as Excel file"""
+        try:
+            import pandas as pd
+        except ImportError:
+            print("Error: pandas and openpyxl are required for Excel export")
+            print("Install with: pip install pandas openpyxl")
+            return
+
+        filepath = os.path.join(self.output_dir, 'inventory_export.xlsx')
+
+        if not self.items:
+            print("No items to save.")
+            return
+
+        # Convert items to DataFrame
+        data = [item.to_dict() for item in self.items]
+        df = pd.DataFrame(data)
+
+        # Remove complex fields
+        df = df.drop(columns=['additional_fields', 'sub_items'], errors='ignore')
+
+        # Create Excel writer with auto-adjusting columns
+        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Inventory')
+
+            # Auto-adjust column widths
+            worksheet = writer.sheets['Inventory']
+            for idx, column in enumerate(df.columns, 1):
+                try:
+                    column_width = max(df[column].astype(str).map(len).max(), len(str(column)))
+                    # Use get_column_letter for proper Excel column naming
+                    from openpyxl.utils import get_column_letter
+                    col_letter = get_column_letter(idx)
+                    worksheet.column_dimensions[col_letter].width = min(column_width + 2, 50)
+                except:
+                    pass  # Skip if column width adjustment fails
+
+        print(f"[OK] Saved Excel: {filepath} ({len(self.items)} items)")
 
     def print_summary(self):
         """Print a summary of the scraped inventory"""
@@ -206,11 +331,14 @@ class InventoryScraper:
             print("No items to export.")
             return
 
-        print("\nExporting inventory data...")
+        if not self.quiet:
+            print("\nExporting inventory data...")
         self.save_json(detailed=False)
         self.save_json(detailed=True)
         self.save_csv()
-        print("\n[OK] All exports completed!")
+        self.save_excel()
+        if not self.quiet:
+            print("\n[OK] All exports completed!")
 
     def run(self):
         """Main method to run the scraper"""
